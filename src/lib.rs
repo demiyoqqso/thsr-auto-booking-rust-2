@@ -681,22 +681,24 @@ fn handle_captcha_request(
     image: &[u8],
     state: &Arc<(Mutex<Option<String>>, Condvar)>,
 ) -> std::io::Result<()> {
-    // Railway's HTTP proxy can deliver the request headers and POST body in
-    // separate TCP packets. A single read() is therefore not reliable for
-    // form submissions. Read the complete headers first, then Content-Length.
+    // Railway's proxy may split HTTP headers and the POST body across
+    // multiple TCP packets. Read the complete headers first, then exactly
+    // Content-Length bytes of body.
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
     let mut buffer = Vec::<u8>::with_capacity(8192);
     let mut chunk = [0u8; 4096];
+    let header_end;
 
     loop {
         let n = stream.read(&mut chunk)?;
         if n == 0 {
-            break;
+            return Ok(());
         }
         buffer.extend_from_slice(&chunk[..n]);
 
-        if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+        if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+            header_end = pos + 4;
             break;
         }
 
@@ -705,20 +707,8 @@ fn handle_captcha_request(
         }
     }
 
-    let header_end = match buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-        Some(pos) => pos + 4,
-        None => return Ok(()),
-    };
-
-let (first_line, content_length) = {
     let headers = String::from_utf8_lossy(&buffer[..header_end]);
-
-    let first_line = headers
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_string();
-
+    let first_line = headers.lines().next().unwrap_or_default().to_string();
     let content_length = headers
         .lines()
         .find_map(|line| {
@@ -731,10 +721,55 @@ let (first_line, content_length) = {
         })
         .unwrap_or(0);
 
-    (first_line, content_length)
-};
+    while buffer.len() < header_end.saturating_add(content_length) {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..n]);
 
-while buffer.len() < header_end.saturating_add(content_length) {
+        if buffer.len() > header_end.saturating_add(content_length).saturating_add(64 * 1024) {
+            return Ok(());
+        }
+    }
+
+    if first_line == "GET / HTTP/1.1" || first_line == "GET / HTTP/1.0" {
+        let html = "<html><body><h3>THSR Auto Booking is running.</h3></body></html>";
+        write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
+        return Ok(());
+    }
+
+    if first_line.starts_with(&format!("GET /captcha/{token}/ ")) {
+        let html = captcha_html(token, image);
+        write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
+        return Ok(());
+    }
+
+    if first_line.starts_with(&format!("POST /captcha/{token}/ ")) {
+        let body_start = header_end.min(buffer.len());
+        let body_end = body_start
+            .saturating_add(content_length)
+            .min(buffer.len());
+        let body = String::from_utf8_lossy(&buffer[body_start..body_end]);
+        let code = form_value(&body, "code").trim().to_string();
+
+        if !code.is_empty() {
+            let (lock, cvar) = &**state;
+            if let Ok(mut value) = lock.lock() {
+                *value = Some(code);
+                cvar.notify_one();
+            }
+
+            let html = "<html><body><h2>CAPTCHA received.</h2><p>訂票程式已收到驗證碼，可以關閉此分頁。</p></body></html>";
+            write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
+            return Ok(());
+        }
+    }
+
+    let html = captcha_html(token, image);
+    write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())
+}
+
 fn captcha_html(token: &str, image: &[u8]) -> String {
     // Embed the CAPTCHA directly in the HTML as a data URI. This avoids a
     // second browser request for /image, which is especially important when

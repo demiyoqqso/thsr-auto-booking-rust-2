@@ -2,7 +2,7 @@
 
 Rust-only THSR booking client. It polls the booking flow, selects the first available train, and continues the booking flow.
 
-## Railway CAPTCHA — no separate captcha-server needed
+## Railway CAPTCHA — same service, robust POST handling
 
 The CAPTCHA web page is served by the **same `thsr-auto-booking-rust` service**. You do **not** need to create another service.
 
