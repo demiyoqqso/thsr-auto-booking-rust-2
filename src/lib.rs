@@ -41,6 +41,7 @@ const FIXED_STUDENTS: u8 = 0;
 const FIXED_SEAT_PREFERENCE: usize = 0; // any
 const FIXED_CLASS_TYPE: usize = 0;      // standard
 const FIXED_RETRY_SECONDS: u64 = 3;
+const FIXED_LATEST_DEPARTURE_MINUTES: u16 = 12 * 60; // 12:00 noon inclusive
 
 
 fn get_header() -> HeaderMap {
@@ -117,7 +118,7 @@ pub fn run(args: Args) {
                 println!("=================================");
                 println!("BOOKING SUCCESS!");
                 println!("=================================");
-                show_result(&resp);
+                let _ = show_result(&resp);
                 break;
             }
             Err(err) => {
@@ -539,6 +540,11 @@ fn wait_for_captcha(img_data: &[u8]) -> String {
     println!("Enter the CAPTCHA and press Submit.");
     println!("=================================");
 
+    send_telegram_message(&format!(
+        "🔐 THSR CAPTCHA required\n\n板橋 → 台中\n日期：{}\n發車條件：07:30～12:00\n\n請開啟驗證碼網址：\n{}\n\n輸入 CAPTCHA 後按送出，程式會自動繼續。",
+        FIXED_DATE, captcha_url
+    ));
+
     // When running directly on a desktop, also try to open the URL for the
     // user. This is deliberately skipped on Railway/headless environments.
     if !is_railway && public_url.is_none() {
@@ -897,13 +903,34 @@ pub fn select_available_trains(&mut self, trains: &[Train]) -> Result<(), String
 
     // 自動選第一班有票車次。
     // 高鐵查詢結果通常已依發車時間排序，因此第一筆就是最早可搭班次。
-    let selected = &trains[0];
+    // Only accept trains departing no later than 12:00. The booking query
+    // already starts at 07:30, so this enforces the requested 07:30~12:00 window.
+    let selected = trains
+        .iter()
+        .find(|train| departure_minutes(&train.depart).is_some_and(|m| m <= FIXED_LATEST_DEPARTURE_MINUTES));
+
+    let Some(selected) = selected else {
+        println!("No train departing between 07:30 and 12:00 is currently available.");
+        return Err("NO_TRAIN_IN_REQUESTED_TIME_WINDOW".to_string());
+    };
+
     println!(
         "AUTO SELECT: Train {} {} -> {}",
         selected.id, selected.depart, selected.arrive
     );
     self.selected_train = selected.form_value.clone();
     Ok(())
+}
+
+fn departure_minutes(value: &str) -> Option<u16> {
+    let (h, m) = value.trim().split_once(':')?;
+    let hour = h.parse::<u16>().ok()?;
+    let minute = m.parse::<u16>().ok()?;
+    if hour < 24 && minute < 60 {
+        Some(hour * 60 + minute)
+    } else {
+        None
+    }
 }
     }
 }
@@ -1143,7 +1170,44 @@ pub mod confirm_ticket_flow {
     }
 }
 
-fn show_result(page: &Html) {
+fn send_telegram_message(text: &str) {
+    let token = match std::env::var("TELEGRAM_BOT_TOKEN") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => {
+            println!("Telegram notification skipped: TELEGRAM_BOT_TOKEN is not set.");
+            return;
+        }
+    };
+
+    let chat_id = match std::env::var("TELEGRAM_CHAT_ID") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => {
+            println!("Telegram notification skipped: TELEGRAM_CHAT_ID is not set.");
+            return;
+        }
+    };
+
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token.trim());
+    let params = [("chat_id", chat_id.trim()), ("text", text)];
+
+    match Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .and_then(|client| client.post(url).form(&params).send())
+    {
+        Ok(resp) if resp.status().is_success() => {
+            println!("Telegram notification sent.");
+        }
+        Ok(resp) => {
+            println!("Telegram notification failed: HTTP {}", resp.status());
+        }
+        Err(err) => {
+            println!("Telegram notification failed: {}", err);
+        }
+    }
+}
+
+fn show_result(page: &Html) -> String {
     let pnr_code_selector = Selector::parse("p.pnr-code span").unwrap();
     let pnr_code_span_tag = page.select(&pnr_code_selector).next().unwrap();
     let pnr_code = pnr_code_span_tag.text().next().unwrap();
@@ -1210,4 +1274,21 @@ fn show_result(page: &Html) {
     let seat_type = seat_type_tag.text().next().unwrap();
     println!("Class: {}{}", seat_type, passenger_count);
     println!("Seats: {}", seats.join(", "));
+
+    send_telegram_message(&format!(
+        "🎉 THSR 訂票成功！\n\nPNR Code：{}\n日期：{}\n時間：{}~{}\n路線：{} → {}\n車廂：{}{}\n座位：{}\n票價：{}\n付款期限：{}",
+        pnr_code.trim(),
+        depart_date.trim(),
+        depart_time.trim(),
+        arrive_time.trim(),
+        depart_from.trim(),
+        arrive_to.trim(),
+        seat_type.trim(),
+        passenger_count.trim(),
+        seats.join(", "),
+        price.trim(),
+        payment_exp_date.trim()
+    ));
+
+    pnr_code.trim().to_string()
 }

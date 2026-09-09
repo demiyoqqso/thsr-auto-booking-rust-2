@@ -43,22 +43,38 @@ The CAPTCHA is intentionally left for manual entry. This project does not attemp
 
 The booking options can be supplied through the existing `THSR_*` variables or CLI arguments. See `src/cli.rs` for the full list.
 
-V6 final package prepared 2026-09-09.
+V9 package prepared 2026-09-09.
 
 
-## V8 — fixed booking settings
+## V9 — fixed booking settings + Telegram notifications
 
 This version removes all interactive booking-selection prompts and fixes the booking target in `src/lib.rs`:
 
 - From: Banqiao (3)
 - To: Taichung (7)
 - Date: `2026/09/25`
-- Earliest departure: `07:30` (the current table's ID 6)
+- Departure window: `07:30` through `12:00` (inclusive)
 - Adults: 2
 - Students: 0
 - Seat: any
 - Class: standard
 - Membership: off
 - Retry when no train is available: 3 seconds
+- Telegram notification: CAPTCHA URL + booking-success PNR
 
 The personal ID is still read from `THSR_PERSONAL_ID` and is not hard-coded. CAPTCHA remains manual.
+
+
+## Telegram notifications
+
+Set these Railway Variables on the same service:
+
+- `TELEGRAM_BOT_TOKEN` — the token from your Telegram bot
+- `TELEGRAM_CHAT_ID` — your Telegram chat ID
+
+The program will send:
+
+1. A message immediately when a CAPTCHA URL is created.
+2. A success message containing the PNR code, train time, route, seat, price, and payment deadline.
+
+If either variable is missing, booking continues normally and Telegram notifications are simply skipped.
