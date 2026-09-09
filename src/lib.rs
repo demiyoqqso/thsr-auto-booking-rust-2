@@ -532,30 +532,20 @@ pub mod booking_flow {
         }
     }
 
-    fn show_image(img_data: &[u8]) {
-        // Save the image to a file
-        let file_name = "tmp_code.jpg";
-        fs::write(file_name, img_data).expect("Failed to write image file");
+   fn show_image(img_data: &[u8]) {
+    let file_name = "tmp_code.jpg";
 
-        // Open the image using the default image viewer
-        if cfg!(target_os = "windows") {
-            Command::new("cmd")
-                .args(&["/C", file_name])
-                .spawn()
-                .expect("Failed to open image");
-        } else if cfg!(target_os = "macos") {
-            Command::new("open")
-                .arg(file_name)
-                .spawn()
-                .expect("Failed to open image");
-        } else if cfg!(target_os = "linux") {
-            Command::new("xdg-open")
-                .arg(file_name)
-                .spawn()
-                .expect("Failed to open image");
-        } else {
-            println!("Please open the image manually: {}", file_name);
-        }
+    fs::write(file_name, img_data)
+        .expect("Failed to write captcha image");
+
+    println!();
+    println!("=================================");
+    println!("CAPTCHA IMAGE SAVED");
+    println!("=================================");
+    println!("File: {}", file_name);
+    println!("Please enter the CAPTCHA manually.");
+    println!("=================================");
+}
     }
 }
 
