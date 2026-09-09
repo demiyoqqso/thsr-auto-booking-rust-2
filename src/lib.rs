@@ -710,7 +710,7 @@ fn handle_captcha_request(
         None => return Ok(()),
     };
 
-    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+    let headers = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
     let first_line = headers.lines().next().unwrap_or_default();
 
     let content_length = headers
