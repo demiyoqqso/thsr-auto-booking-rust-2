@@ -613,7 +613,7 @@ fn wait_for_captcha(img_data: &[u8]) -> String {
         || std::env::var_os("RAILWAY_PROJECT_ID").is_some();
 
     let captcha_url = match public_url {
-        Some(base) => format!("{}/captcha/{}/", base.trim_end_matches('/'), token),
+        Some(ref base) => format!("{}/captcha/{}/", base.trim_end_matches('/'), token),
         None if is_railway => {
             println!();
             println!("=================================");
