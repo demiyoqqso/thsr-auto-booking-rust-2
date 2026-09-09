@@ -597,15 +597,19 @@ fn wait_for_captcha(img_data: &[u8]) -> String {
     // On Railway the browser is NOT inside this container, so we must give
     // the user a public URL. Prefer an explicit URL, then Railway's generated
     // public domain.
+    // Public URL for the SAME Railway service. No separate captcha service is
+    // required. THSR_PUBLIC_URL is preferred; Railway's generated public
+    // domain is used automatically when available.
     let public_url = std::env::var("THSR_PUBLIC_URL")
         .or_else(|_| std::env::var("RAILWAY_PUBLIC_DOMAIN"))
+        .or_else(|_| std::env::var("RAILWAY_STATIC_URL"))
         .ok()
-        .map(|domain| {
-            let domain = domain.trim().trim_end_matches('/');
-            if domain.starts_with("http://") || domain.starts_with("https://") {
-                domain.to_string()
+        .map(|value| {
+            let value = value.trim().trim_end_matches('/');
+            if value.starts_with("http://") || value.starts_with("https://") {
+                value.to_string()
             } else {
-                format!("https://{domain}")
+                format!("https://{value}")
             }
         });
 
