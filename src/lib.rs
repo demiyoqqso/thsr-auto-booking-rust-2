@@ -10,8 +10,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs;
-use std::process::Command;
 use std::str::FromStr;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::cli::Args;
 use crate::schema::{STATION_MAP, TIME_TABLE, TicketType};
@@ -67,44 +70,60 @@ fn get_input<T: FromStr>(hint: &str, default: T) -> T {
 }
 
 pub fn run(args: Args) {
+    let retry_seconds = args.retry_seconds;
     let policy = reqwest::redirect::Policy::limited(20);
     let client = Client::builder()
         .redirect(policy)
         .default_headers(get_header())
         .cookie_store(true)
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(Duration::from_secs(60))
         .build()
-        .unwrap();
+        .expect("Failed to create HTTP client");
 
-    // First page
-    let resp = match booking_flow::run_flow(&client, &args) {
-        Ok(resp) => resp,
-        Err(err_msg) => {
-            println!("Error: {}", err_msg);
-            return;
+    let mut attempt = 0u64;
+    loop {
+        attempt += 1;
+        println!();
+        println!("=================================");
+        println!("THSR AUTO BOOKING - ATTEMPT {}", attempt);
+        println!("=================================");
+
+        match run_once(&client, &args) {
+            Ok(resp) => {
+                if !has_booking_result(&resp) {
+                    println!("Booking flow finished without a PNR. The site may have rejected the request.");
+                    println!("Retrying in {} seconds...", retry_seconds);
+                    std::thread::sleep(Duration::from_secs(retry_seconds));
+                    continue;
+                }
+
+                println!("=================================");
+                println!("BOOKING SUCCESS!");
+                println!("=================================");
+                show_result(&resp);
+                break;
+            }
+            Err(err) => {
+                println!("Booking attempt failed: {}", err);
+                println!("Retrying in {} seconds...", retry_seconds);
+                std::thread::sleep(Duration::from_secs(retry_seconds));
+            }
         }
-    };
+    }
+}
 
-    // Second Page
-    let resp = match confirm_train_flow::run_flow(resp, &client) {
-        Ok(resp) => resp,
-        Err(err_msg) => {
-            println!("Error: {}", err_msg);
-            return;
-        }
-    };
+fn run_once(client: &Client, args: &Args) -> Result<Html, String> {
+    let resp = booking_flow::run_flow(client, args)?;
+    let resp = confirm_train_flow::run_flow(resp, client)?;
+    confirm_ticket_flow::run_flow(&resp, client, args)
+}
 
-    // Final page
-    let resp = match confirm_ticket_flow::run_flow(&resp, &client, &args) {
-        Ok(resp) => resp,
-        Err(err_msg) => {
-            println!("Error: {}", err_msg);
-            return;
-        }
-    };
 
-    // Show the final booking result
-    show_result(&resp);
+fn has_booking_result(page: &Html) -> bool {
+    Selector::parse("p.pnr-code span")
+        .ok()
+        .and_then(|selector| page.select(&selector).next())
+        .is_some()
 }
 
 pub fn parse_error(page: &Html) -> Option<String> {
@@ -373,14 +392,7 @@ pub mod booking_flow {
         }
 
         pub fn input_security_code(&mut self, img_data: Bytes) {
-            println!("Input security code:");
-            show_image(&img_data);
-            // Read the security code from the user
-            let mut input = String::new();
-            std::io::stdin()
-                .read_line(&mut input)
-                .expect("Failed to read input");
-            self.security_code = input.trim().to_string();
+            self.security_code = wait_for_captcha(&img_data);
         }
 
         pub fn select_date(
@@ -444,7 +456,7 @@ pub mod booking_flow {
                 }
             };
 
-            if opt > TIME_TABLE.len() {
+            if opt == 0 || opt > TIME_TABLE.len() {
                 println!("Invalid input, defaulting to 10.");
                 self.outbound_time = TIME_TABLE[9].to_string();
                 return;
@@ -532,21 +544,265 @@ pub mod booking_flow {
         }
     }
 
-   fn show_image(img_data: &[u8]) {
-    let file_name = "tmp_code.jpg";
-
-    fs::write(file_name, img_data)
+fn wait_for_captcha(img_data: &[u8]) -> String {
+    fs::write("tmp_code.jpg", img_data)
         .expect("Failed to write captcha image");
+
+    let token = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+
+    let state = Arc::new((Mutex::new(None::<String>), Condvar::new()));
+
+    // Railway provides the listening port through PORT. Locally we use an
+    // ephemeral port so multiple copies can run without conflicts.
+    let port = std::env::var("PORT").unwrap_or_else(|_| "0".to_string());
+    let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
+        .or_else(|_| TcpListener::bind("127.0.0.1:0"))
+        .expect("Failed to start CAPTCHA web server");
+    let addr = listener
+        .local_addr()
+        .expect("Failed to read CAPTCHA server address");
+
+    let state_for_thread = Arc::clone(&state);
+    let image = img_data.to_vec();
+    let token_for_thread = token.clone();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = handle_captcha_request(
+                &mut stream,
+                &token_for_thread,
+                &image,
+                &state_for_thread,
+            );
+
+            if state_for_thread
+                .0
+                .lock()
+                .map(|g| g.is_some())
+                .unwrap_or(true)
+            {
+                break;
+            }
+        }
+    });
+
+    // On Railway the browser is NOT inside this container, so we must give
+    // the user a public URL. Prefer an explicit URL, then Railway's generated
+    // public domain.
+    let public_url = std::env::var("THSR_PUBLIC_URL")
+        .or_else(|_| std::env::var("RAILWAY_PUBLIC_DOMAIN"))
+        .ok()
+        .map(|domain| {
+            let domain = domain.trim().trim_end_matches('/');
+            if domain.starts_with("http://") || domain.starts_with("https://") {
+                domain.to_string()
+            } else {
+                format!("https://{domain}")
+            }
+        });
+
+    let is_railway = std::env::var_os("RAILWAY_ENVIRONMENT_NAME").is_some()
+        || std::env::var_os("RAILWAY_PROJECT_ID").is_some();
+
+    let captcha_url = match public_url {
+        Some(base) => format!("{}/captcha/{}/", base.trim_end_matches('/'), token),
+        None if is_railway => {
+            println!();
+            println!("=================================");
+            println!("CAPTCHA URL NOT AVAILABLE");
+            println!("=================================");
+            println!("The CAPTCHA server is running on Railway, but this service has no public URL.");
+            println!("1. Railway -> Service -> Settings -> Networking -> Generate Domain");
+            println!("2. Redeploy the service");
+            println!("3. Or set THSR_PUBLIC_URL=https://YOUR-DOMAIN in Railway Variables");
+            println!("=================================");
+            return String::new();
+        }
+        None => format!("http://127.0.0.1:{}/captcha/{}/", addr.port(), token),
+    };
 
     println!();
     println!("=================================");
-    println!("CAPTCHA IMAGE SAVED");
+    println!("CAPTCHA REQUIRED");
     println!("=================================");
-    println!("File: {}", file_name);
-    println!("Please enter the CAPTCHA manually.");
+    println!("Open this URL in your browser:");
+    println!("{captcha_url}");
+    println!("Enter the CAPTCHA and press Submit.");
     println!("=================================");
-}
+
+    // When running directly on a desktop, also try to open the URL for the
+    // user. This is deliberately skipped on Railway/headless environments.
+    if !is_railway && public_url.is_none() {
+        open_in_browser(&captcha_url);
     }
+
+    let (lock, cvar) = &*state;
+    let mut code = lock.lock().expect("captcha state poisoned");
+    while code.is_none() {
+        code = cvar.wait(code).expect("captcha state poisoned");
+    }
+    code.take().unwrap_or_default()
+}
+
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+fn handle_captcha_request(
+    stream: &mut TcpStream,
+    token: &str,
+    image: &[u8],
+    state: &Arc<(Mutex<Option<String>>, Condvar)>,
+) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+
+    let mut buffer = [0u8; 16384];
+    let n = stream.read(&mut buffer)?;
+    let request = String::from_utf8_lossy(&buffer[..n]);
+    let first_line = request.lines().next().unwrap_or_default();
+
+    if first_line == "GET / HTTP/1.1" || first_line == "GET / HTTP/1.0" {
+        let html = "<html><body><h3>THSR Auto Booking is running.</h3></body></html>";
+        write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
+        return Ok(());
+    }
+
+    if first_line.starts_with(&format!("GET /captcha/{token}/ ")) {
+        let html = captcha_html(token, image);
+        write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
+        return Ok(());
+    }
+
+    if first_line.starts_with(&format!("POST /captcha/{token}/ ")) {
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let code = form_value(body, "code");
+        if !code.is_empty() {
+            let (lock, cvar) = &**state;
+            if let Ok(mut value) = lock.lock() {
+                *value = Some(code);
+                cvar.notify_one();
+            }
+            let html = "<html><body><h2>CAPTCHA received.</h2><p>訂票程式已收到驗證碼，可以關閉此分頁。</p></body></html>";
+            write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
+            return Ok(());
+        }
+    }
+
+    let html = captcha_html(token, image);
+    write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())
+}
+
+fn captcha_html(token: &str, image: &[u8]) -> String {
+    // Embed the CAPTCHA directly in the HTML as a data URI. This avoids a
+    // second browser request for /image, which is especially important when
+    // the program is running behind Railway's public proxy.
+    let image_b64 = base64_encode(image);
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>THSR CAPTCHA</title></head><body style=\"font-family:sans-serif;max-width:520px;margin:40px auto;padding:20px\"><h2>台灣高鐵驗證碼</h2><p>請看圖片輸入驗證碼：</p><img src=\"data:image/jpeg;base64,{image_b64}\" alt=\"CAPTCHA\" style=\"max-width:100%;image-rendering:auto;border:1px solid #ccc\"><form method=\"post\" action=\"/captcha/{token}/\" style=\"margin-top:20px\"><input name=\"code\" autocomplete=\"off\" autofocus style=\"font-size:24px;width:180px\"><button type=\"submit\" style=\"font-size:20px;margin-left:8px\">送出</button></form></body></html>"
+    )
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().saturating_add(2) / 3 * 4);
+
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[((b0 & 0b0000_0011) << 4 | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((b1 & 0b0000_1111) << 2 | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+
+    out
+}
+
+fn form_value(body: &str, key: &str) -> String {
+    body.split('&')
+        .find_map(|pair| {
+            let mut it = pair.splitn(2, '=');
+            let k = it.next()?;
+            let v = it.next().unwrap_or_default();
+            if k == key { Some(url_decode(v)) } else { None }
+        })
+        .unwrap_or_default()
+}
+
+fn url_decode(value: &str) -> String {
+    let mut out = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let Ok(v) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                    out.push(v);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn write_http(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body)
+}
 }
 
 // Second page: Confirm Train Flow
@@ -554,14 +810,14 @@ pub mod confirm_train_flow {
     use super::*;
 
     pub fn run_flow(document: Html, client: &Client) -> Result<Html, String> {
-        // Parse alerts
         let alerts = parse_alert_body(&document);
-        println!("{}", alerts.join("\n"));
+        if !alerts.is_empty() {
+            println!("{}", alerts.join("\n"));
+        }
 
-        // Parse available trains
         let trains = parse_trains(&document);
         let mut payload = ConfirmTrainPayload::default();
-        payload.select_available_trains(trains.as_slice());
+        payload.select_available_trains(trains.as_slice())?;
 
         let resp = client
             .post(CONFIRM_TRAIN_URL)
@@ -667,22 +923,36 @@ pub mod confirm_train_flow {
     }
 
     impl ConfirmTrainPayload {
-        pub fn select_available_trains(&mut self, trains: &[Train]) {
-            for (idx, train) in trains.iter().enumerate() {
-                println!(
-                    "{:>2}. {:>4} {:>3}~{} {:>3} {}",
-                    idx + 1,
-                    train.id,
-                    train.depart,
-                    train.arrive,
-                    train.travel_time,
-                    train.discount_info
-                );
-            }
+pub fn select_available_trains(&mut self, trains: &[Train]) -> Result<(), String> {
+    if trains.is_empty() {
+        println!("No available trains.");
+        return Err("NO_TRAIN_AVAILABLE".to_string());
+    }
 
-            let selection = get_input("Select a train (default: 1):", 1);
-            self.selected_train = trains[selection - 1].form_value.clone();
-        }
+    println!();
+    println!("===== AVAILABLE TRAIN =====");
+    for (idx, train) in trains.iter().enumerate() {
+        println!(
+            "{:>2}. {:>4} {:>5}~{:>5} {:>4} {}",
+            idx + 1,
+            train.id,
+            train.depart,
+            train.arrive,
+            train.travel_time,
+            train.discount_info
+        );
+    }
+
+    // 自動選第一班有票車次。
+    // 高鐵查詢結果通常已依發車時間排序，因此第一筆就是最早可搭班次。
+    let selected = &trains[0];
+    println!(
+        "AUTO SELECT: Train {} {} -> {}",
+        selected.id, selected.depart, selected.arrive
+    );
+    self.selected_train = selected.form_value.clone();
+    Ok(())
+}
     }
 }
 
