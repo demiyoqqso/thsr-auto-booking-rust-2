@@ -44,3 +44,21 @@ The CAPTCHA is intentionally left for manual entry. This project does not attemp
 The booking options can be supplied through the existing `THSR_*` variables or CLI arguments. See `src/cli.rs` for the full list.
 
 V6 final package prepared 2026-09-09.
+
+
+## V8 — fixed booking settings
+
+This version removes all interactive booking-selection prompts and fixes the booking target in `src/lib.rs`:
+
+- From: Banqiao (3)
+- To: Taichung (7)
+- Date: `2026/09/25`
+- Earliest departure: `07:30` (the current table's ID 6)
+- Adults: 2
+- Students: 0
+- Seat: any
+- Class: standard
+- Membership: off
+- Retry when no train is available: 3 seconds
+
+The personal ID is still read from `THSR_PERSONAL_ID` and is not hard-coded. CAPTCHA remains manual.

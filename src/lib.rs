@@ -27,6 +27,22 @@ static CONFIRM_TRAIN_URL: &str =
 static CONFIRM_TICKET_URL: &str =
     "https://irs.thsrc.com.tw/IMINT/?wicket:interface=:2:BookingS3Form::IFormSubmitListener";
 
+// ===== FIXED BOOKING SETTINGS =====
+// Change these values here when you want a different booking target.
+// No interactive prompts are used for these settings.
+const FIXED_FROM: usize = 3;          // Banqiao
+const FIXED_TO: usize = 7;              // Taichung
+const FIXED_DATE: &str = "2026/09/25";
+// The current TIME_TABLE maps 07:30 to ID 6.
+// This is the earliest departure time; the site may return any train at/after it.
+const FIXED_TIME_ID: usize = 6;
+const FIXED_ADULTS: u8 = 2;
+const FIXED_STUDENTS: u8 = 0;
+const FIXED_SEAT_PREFERENCE: usize = 0; // any
+const FIXED_CLASS_TYPE: usize = 0;      // standard
+const FIXED_RETRY_SECONDS: u64 = 3;
+
+
 fn get_header() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert("Host", HeaderValue::from_static("irs.thsrc.com.tw"));
@@ -70,7 +86,8 @@ fn get_input<T: FromStr>(hint: &str, default: T) -> T {
 }
 
 pub fn run(args: Args) {
-    let retry_seconds = args.retry_seconds;
+    let retry_seconds = FIXED_RETRY_SECONDS;
+    println!("FIXED SETTINGS: Banqiao -> Taichung | date {} | from 07:30 (TIME_TABLE ID {}) | adults {} | students {} | seat any | class standard | membership off | retry {}s", FIXED_DATE, FIXED_TIME_ID, FIXED_ADULTS, FIXED_STUDENTS, FIXED_RETRY_SECONDS);
     let policy = reqwest::redirect::Policy::limited(20);
     let client = Client::builder()
         .redirect(policy)
@@ -166,22 +183,18 @@ pub mod booking_flow {
         let mut payload = BookingPayload::default();
         payload.search_by = parse_search_by(&document);
         payload.types_of_trip = parse_types_of_trip_value(&document);
-        payload.select_start_station(&args.from);
-        payload.select_dest_station(&args.to);
+        payload.select_start_station(FIXED_FROM);
+        payload.select_dest_station(FIXED_TO);
         let (start_date, end_date) = parse_avail_start_end_date(&document);
-        payload.select_date(&start_date, &end_date, &args.date);
-        payload.select_time(&args.time);
-        if args.adult_cnt.is_none() && args.student_cnt.is_none() {
-            payload.select_ticket_num(TicketType::Adult, &None);
+        let fixed_date = FIXED_DATE.to_string();
+        payload.select_date(&start_date, &end_date, &fixed_date);
+        payload.select_time(FIXED_TIME_ID);
+        payload.select_ticket_num(TicketType::Adult, FIXED_ADULTS);
+        if FIXED_STUDENTS > 0 {
+            payload.select_ticket_num(TicketType::College, FIXED_STUDENTS);
         }
-        if args.adult_cnt.is_some() {
-            payload.select_ticket_num(TicketType::Adult, &args.adult_cnt);
-        }
-        if args.student_cnt.is_some() {
-            payload.select_ticket_num(TicketType::College, &args.student_cnt);
-        }
-        payload.select_seat_prefer(&args.seat_prefer);
-        payload.select_class_type(&args.class_type);
+        payload.select_seat_prefer(FIXED_SEAT_PREFERENCE);
+        payload.select_class_type(FIXED_CLASS_TYPE);
         payload.input_security_code(img_resp.bytes().unwrap());
 
         // Make the booking request
@@ -355,40 +368,12 @@ pub mod booking_flow {
     }
 
     impl BookingPayload {
-        pub fn select_start_station(&mut self, from: &Option<usize>) {
-            if let Some(from) = from {
-                self.start_station = from.clone() as u8;
-                return;
-            }
-
-            for (i, station) in STATION_MAP.iter().enumerate() {
-                println!("{}: {:?}", i + 1, station);
-            }
-            let input = get_input("Please select start station (default: 1):", 1);
-            if input > 0 && input <= STATION_MAP.len() {
-                self.start_station = input as u8;
-            } else {
-                println!("Invalid input, defaulting to Nangang.");
-                self.start_station = 1;
-            }
+        pub fn select_start_station(&mut self, from: usize) {
+            self.start_station = from as u8;
         }
 
-        pub fn select_dest_station(&mut self, to: &Option<usize>) {
-            if let Some(to) = to {
-                self.dest_station = to.clone() as u8;
-                return;
-            }
-
-            for (i, station) in STATION_MAP.iter().enumerate() {
-                println!("{}: {:?}", i + 1, station);
-            }
-            let input = get_input("Please select destination station (default: 12):", 12);
-            if input > 0 && input <= STATION_MAP.len() {
-                self.dest_station = input as u8;
-            } else {
-                println!("Invalid input, defaulting to Zuouing.");
-                self.dest_station = 12;
-            }
+        pub fn select_dest_station(&mut self, to: usize) {
+            self.dest_station = to as u8;
         }
 
         pub fn input_security_code(&mut self, img_data: Bytes) {
@@ -399,89 +384,27 @@ pub mod booking_flow {
             &mut self,
             start_date: &String,
             end_date: &String,
-            date: &Option<String>,
+            date: &String,
         ) {
-            let input = match date.clone() {
-                Some(date) => date,
-                None => get_input(
-                    &format!(
-                        "Please select a date between {} and {} (default to {}):",
-                        start_date, end_date, start_date
-                    ),
-                    start_date.clone(),
-                ),
-            };
-
-            let input = match normalize_date(&input) {
-                Some(date) => date,
-                None => {
-                    println!("Invalid date format, defaulting to {}", start_date);
-                    start_date.clone()
-                }
-            };
-
-            if input.is_empty() {
-                self.outbound_date = start_date.clone();
-                return;
-            }
-
+            let input = normalize_date(date).unwrap_or_else(|| start_date.clone());
             if input.ge(start_date) && input.le(end_date) {
                 self.outbound_date = input;
             } else {
-                println!("Invalid date, defaulting to {}", start_date);
-                self.outbound_date = start_date.to_string();
+                println!("Fixed date {} is outside the site's available range {} ~ {}; using {}.", date, start_date, end_date, start_date);
+                self.outbound_date = start_date.clone();
             }
         }
 
-        pub fn select_time(&mut self, time: &Option<usize>) {
-            let opt = match time.clone() {
-                Some(time) => time,
-                None => {
-                    for (idx, &t_str) in TIME_TABLE.iter().enumerate() {
-                        let mut t_int = t_str[..t_str.len() - 1].parse::<u16>().unwrap();
-                        if t_str.ends_with('A') && (t_int / 100) == 12 {
-                            t_int %= 1200;
-                        } else if t_int != 1230 && t_str.ends_with('P') {
-                            t_int += 1200;
-                        }
-                        let formatted_time = format!("{:04}", t_int);
-                        println!(
-                            "{}. {}:{}",
-                            idx + 1,
-                            &formatted_time[..formatted_time.len() - 2],
-                            &formatted_time[formatted_time.len() - 2..]
-                        );
-                    }
-                    get_input("Select departure time (default: 10):", 10)
-                }
-            };
-
+        pub fn select_time(&mut self, opt: usize) {
             if opt == 0 || opt > TIME_TABLE.len() {
-                println!("Invalid input, defaulting to 10.");
                 self.outbound_time = TIME_TABLE[9].to_string();
-                return;
+            } else {
+                self.outbound_time = TIME_TABLE[opt - 1].to_string();
             }
-
-            self.outbound_time = TIME_TABLE[opt - 1].to_string();
         }
 
-        pub fn select_ticket_num(&mut self, ticket_type: TicketType, val: &Option<u8>) {
-            let mut val = match val.clone() {
-                Some(val) => val,
-                None => get_input(
-                    &format!(
-                        "Please select the number (0~10) of tickets for {:?} (default: 1)",
-                        ticket_type
-                    ),
-                    1,
-                ),
-            };
-
-            if val > 10 {
-                println!("Invalid input, defaulting to 1.");
-                val = 1;
-            }
-
+        pub fn select_ticket_num(&mut self, ticket_type: TicketType, val: u8) {
+            let val = val.min(10);
             let val = format!("{}{}", val, (ticket_type.clone() as u8) as char);
             match ticket_type {
                 TicketType::Adult => self.adult_ticket_num = val,
@@ -492,38 +415,12 @@ pub mod booking_flow {
             }
         }
 
-        pub fn select_seat_prefer(&mut self, prefer: &Option<usize>) {
-            let input = match prefer.clone() {
-                Some(prefer) => prefer,
-                None => get_input(
-                    "Please select seat preference (0: any, 1: window, 2: aisle) (default: 0):",
-                    0,
-                ),
-            };
-
-            if input > 2 {
-                println!("Invalid input, defaulting to any.");
-                self.seat_prefer = 0;
-            } else {
-                self.seat_prefer = input;
-            }
+        pub fn select_seat_prefer(&mut self, prefer: usize) {
+            self.seat_prefer = if prefer <= 2 { prefer } else { 0 };
         }
 
-        pub fn select_class_type(&mut self, class_type: &Option<usize>) {
-            let input = match class_type.clone() {
-                Some(class_type) => class_type,
-                None => get_input(
-                    "Please select class type (0: standard, 1: business) (default: 0):",
-                    0,
-                ),
-            };
-
-            if input > 1 {
-                println!("Invalid input, defaulting to standard.");
-                self.class_type = 0;
-            } else {
-                self.class_type = input as u8;
-            }
+        pub fn select_class_type(&mut self, class_type: usize) {
+            self.class_type = if class_type <= 1 { class_type as u8 } else { 0 };
         }
     }
 
@@ -1026,7 +923,7 @@ pub mod confirm_ticket_flow {
 
         // Parse membership radio
         let (radio_value, add_payload) =
-            process_membership(&document, &personal_id, &args.use_membership);
+            process_membership(&document, &personal_id, false);
         payload.member_radio = radio_value;
 
         // Additional flow for early bird
@@ -1121,17 +1018,10 @@ pub mod confirm_ticket_flow {
 
     impl ConfirmTicketPayload {
         pub fn input_personal_id(&mut self, personal_id: &Option<String>) -> String {
-            let input = match personal_id.clone() {
-                Some(id) => id,
-                None => {
-                    println!("Input personal ID:");
-                    let mut input = String::new();
-                    std::io::stdin().read_line(&mut input).unwrap_or_default();
-                    let input: String = input.trim().to_string();
-                    input
-                }
-            };
-
+            let input = personal_id.clone().unwrap_or_default();
+            if input.trim().is_empty() {
+                panic!("THSR_PERSONAL_ID is required. Add it to Railway Variables.");
+            }
             self.personal_id = input.trim().to_string();
             self.personal_id.clone()
         }
@@ -1140,17 +1030,9 @@ pub mod confirm_ticket_flow {
     fn process_membership(
         page: &Html,
         membership_id: &String,
-        to_use_membership: &Option<bool>,
+        to_use_membership: bool,
     ) -> (String, Option<String>) {
-        let use_membership = match to_use_membership {
-            Some(v) => *v,
-            None => {
-                match get_input("Use membership (y/n, default: n):", "n".to_string()).as_str() {
-                    "y" => true,
-                    _ => false,
-                }
-            }
-        };
+        let use_membership = to_use_membership;
 
         let sel_str = match use_membership {
             true => "#memberSystemRadio1",
@@ -1190,10 +1072,7 @@ pub mod confirm_ticket_flow {
             return None;
         }
 
-        let personal_id = get_input(
-            &format!("Passenger's ID number (default: {}):", personal_id),
-            personal_id.to_string(),
-        );
+        let personal_id = personal_id.to_string();
 
         let early_type_selector = Selector::parse(
             "input[name='TicketPassengerInfoInputPanel:passengerDataView:0:passengerDataView2:passengerDataTypeName']").unwrap();
