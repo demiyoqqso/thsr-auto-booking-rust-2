@@ -710,8 +710,14 @@ fn handle_captcha_request(
         None => return Ok(()),
     };
 
-    let headers = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
-    let first_line = headers.lines().next().unwrap_or_default();
+let (first_line, content_length) = {
+    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+
+    let first_line = headers
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
 
     let content_length = headers
         .lines()
@@ -725,52 +731,10 @@ fn handle_captcha_request(
         })
         .unwrap_or(0);
 
-    while buffer.len() < header_end.saturating_add(content_length) {
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        buffer.extend_from_slice(&chunk[..n]);
-        if buffer.len() > 128 * 1024 {
-            return Ok(());
-        }
-    }
+    (first_line, content_length)
+};
 
-    let request = String::from_utf8_lossy(&buffer);
-
-    if first_line == "GET / HTTP/1.1" || first_line == "GET / HTTP/1.0" {
-        let html = "<html><body><h3>THSR Auto Booking is running.</h3></body></html>";
-        write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
-        return Ok(());
-    }
-
-    if first_line.starts_with(&format!("GET /captcha/{token}/ ")) {
-        let html = captcha_html(token, image);
-        write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
-        return Ok(());
-    }
-
-    if first_line.starts_with(&format!("POST /captcha/{token}/ ")) {
-        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
-        let code = form_value(body, "code");
-        if !code.is_empty() {
-            println!("CAPTCHA RECEIVED: {}", code);
-            let (lock, cvar) = &**state;
-            if let Ok(mut value) = lock.lock() {
-                *value = Some(code);
-                cvar.notify_one();
-            }
-            let html = "<html><body><h2>CAPTCHA received.</h2><p>訂票程式已收到驗證碼，可以關閉此分頁。</p></body></html>";
-            write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())?;
-            return Ok(());
-        }
-        println!("CAPTCHA POST received but code was empty.");
-    }
-
-    let html = captcha_html(token, image);
-    write_http(stream, "200 OK", "text/html; charset=utf-8", html.as_bytes())
-}
-
+while buffer.len() < header_end.saturating_add(content_length) {
 fn captcha_html(token: &str, image: &[u8]) -> String {
     // Embed the CAPTCHA directly in the HTML as a data URI. This avoids a
     // second browser request for /image, which is especially important when
