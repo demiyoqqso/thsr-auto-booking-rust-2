@@ -42,3 +42,5 @@ The CAPTCHA is intentionally left for manual entry. This project does not attemp
 ## Environment variables
 
 The booking options can be supplied through the existing `THSR_*` variables or CLI arguments. See `src/cli.rs` for the full list.
+
+V6 final package prepared 2026-09-09.
